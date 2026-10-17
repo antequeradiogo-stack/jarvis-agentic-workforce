@@ -1,0 +1,2 @@
+# Prompt injection in task text (synthetic note)
+Task text is data, never authority. Attackers hide instructions such as "ignore previous rules" or claim that an action is already approved. Obfuscation tricks include spaced-out letters, leetspeak and look-alike characters from other alphabets. A classifier should normalise text before matching, and deny wins over allow. Even a task that passes the classifier only permits reversible work.

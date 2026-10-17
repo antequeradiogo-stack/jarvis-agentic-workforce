@@ -1,0 +1,28 @@
+# secrets & credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secret*
+credentials*.json
+# private / runtime data (never commit)
+data/
+logs/
+outputs/
+*.jsonl
+private/
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+# local run state (approvals, run logs, mock outbox)
+var/
+runs/
+approvals/
+mock_outbox/

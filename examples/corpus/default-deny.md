@@ -1,0 +1,2 @@
+# Default-deny tool gates (synthetic note)
+An agent should only run actions that are explicitly allowed. Reading and summarising local documents are reversible, so they can be allow-listed. Sending email, publishing content and purchasing are consequential and must be denied by default. Unknown actions are treated as consequential, because a deny-list always misses something new. The gate sits between the agent and the tool, so the agent cannot skip it.

@@ -1,0 +1,2 @@
+# Idempotency and recovery (synthetic note)
+Long-running agent workflows crash. Writing every completed step to an append-only log turns that log into a checkpoint. On restart, completed steps are skipped and their stored outputs are reused. Side effects carry an idempotency key derived from the run and the request, so a retried or resumed call never sends the same email twice. Retries use exponential backoff so a struggling dependency is not hammered.

@@ -1,0 +1,2 @@
+# Binding approvals to requests (synthetic note)
+A human approval should authorise one exact request, not a whole category of actions. Hashing the canonical action and parameters gives a fingerprint that the approval is bound to. If any parameter changes, the hash changes and the approval no longer matches. Approvals should expire quickly and be single-use, so a leaked or replayed approval is worthless. A signature over the approval detects tampering with the expiry or the bound hash.

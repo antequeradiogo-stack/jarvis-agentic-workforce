@@ -1,0 +1,1 @@
+{"task_id": "demo-email-001", "kind": "research", "goal": "Research default-deny tool gates and draft a short report for the reviewer.", "deliver": {"action": "send_email", "params": {"to": "reviewer@example.com", "subject": "Draft report: default-deny tool gates"}}}
