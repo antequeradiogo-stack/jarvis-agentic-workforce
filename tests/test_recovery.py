@@ -8,8 +8,7 @@ from jarvis_workforce.runlog import RunLog
 
 class Resume(WorkflowCase):
     def approve_pending(self, run_id):
-        req = self.last_approval_request(run_id)
-        self.store.issue(req["action"], req["params"], ttl=60)
+        self.issue_for(self.last_approval_request(run_id))
 
     def test_crash_after_research_resumes_at_write(self):
         o = self.make(crash_at={"after_step:research"})
@@ -70,6 +69,59 @@ class Resume(WorkflowCase):
             f.write('{"seq": 99, "event": "step_comp')  # crash mid-write
         self.assertEqual(o.run(research_task()).status, "completed")
 
+    def test_torn_outbox_resume_does_not_duplicate(self):
+        o = self.make()
+        o.run(email_task()); self.approve_pending("t-email-1"); o.run(email_task())
+        first = self.toolbox.effects()
+        self.assertEqual(len(first), 1)
+        with open(self.toolbox.effects_file, "ab") as f:
+            f.write(b'{"effect_id":"torn"')
+        self.assertEqual(self.toolbox.effects(), first)
+        p = self.work / "runs" / "t-email-1" / "events.jsonl"
+        kept = [l for l in p.read_text().splitlines() if '"effect_committed"' not in l and '"run_finished"' not in l]
+        p.write_text("\n".join(kept) + "\n")
+        r = o.run(email_task())
+        self.assertEqual(r.status, "completed")
+        self.assertTrue(r.effects[0]["recovered"])
+        self.assertEqual(self.toolbox.effects(), first)
+
+    def test_torn_outbox_tail_is_replaced_by_one_effect(self):
+        self.make()
+        self.toolbox.effects_file.write_bytes(b'{"effect_id": "partial')
+        self.assertEqual(self.toolbox.effects(), [])
+        self.toolbox._effect("send_email", {"to": "a@example.com"}, "idem-1")
+        parsed = self.toolbox.effects()
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["idempotency_key"], "idem-1")
+        self.assertNotIn(b"partial", self.toolbox.effects_file.read_bytes())
+        again = self.toolbox._effect("send_email", {"to": "a@example.com"}, "idem-1")
+        self.assertTrue(again["deduped"])
+        self.assertEqual(len(self.toolbox.effects()), 1)
+
+    def test_corrupt_middle_effect_line_is_not_skipped(self):
+        self.make()
+        self.toolbox._effect("send_email", {"to": "a@example.com"}, "idem-1")
+        good = self.toolbox.effects_file.read_bytes()
+        self.toolbox.effects_file.write_bytes(b'{"nope"\n' + good)
+        with self.assertRaises(json.JSONDecodeError):
+            self.toolbox.effects()
+        with self.assertRaises(json.JSONDecodeError):
+            self.toolbox._effect("send_email", {"to": "b@example.com"}, "idem-2")
+        self.assertEqual(self.toolbox.effects_file.read_bytes(), b'{"nope"\n' + good)
+
+    def test_complete_effect_without_trailing_newline_is_not_resent(self):
+        self.make()
+        self.toolbox._effect("send_email", {"to": "a@example.com"}, "idem-1")
+        self.toolbox.effects_file.write_bytes(self.toolbox.effects_file.read_bytes().rstrip(b"\n"))
+        self.assertEqual(len(self.toolbox.effects()), 1)
+        again = self.toolbox._effect("send_email", {"to": "a@example.com"}, "idem-1")
+        self.assertTrue(again["deduped"])
+        self.assertEqual(len(self.toolbox.effects()), 1)
+        self.toolbox._effect("publish", {"to": "a@example.com"}, "idem-2")
+        parsed = self.toolbox.effects()
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual({e["idempotency_key"] for e in parsed}, {"idem-1", "idem-2"})
+
 
 class ApproveCli(unittest.TestCase):
     def test_run_approve_resume_via_cli(self):
@@ -108,6 +160,79 @@ class ApproveCli(unittest.TestCase):
                 self.assertIn("status=blocked", out.getvalue())
         finally:
             if env: os.environ["JARVIS_APPROVAL_KEY"] = env
+
+    def test_malformed_key_clis_fail_closed(self):
+        from jarvis_workforce import approve, demo, run
+        root = Path(__file__).resolve().parents[1]
+        task = str(root / "examples" / "tasks" / "research_and_email.json")
+        old = os.environ.pop("JARVIS_APPROVAL_KEY", None)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                os.environ["JARVIS_APPROVAL_KEY"] = "k" * 32
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(run.main(["--workdir", d, "--task", task, "--no-json"]), 10)
+                for bad in ("hex:zzzz", "tiny-key"):
+                    os.environ["JARVIS_APPROVAL_KEY"] = bad
+                    err, out = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        code = approve.main(["--workdir", d, "--run", "demo-email-001", "--yes"])
+                    self.assertEqual(code, 3, bad)
+                    self.assertIn("refusing:", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+                    self.assertNotIn(bad, err.getvalue())
+                    self.assertNotIn("action:", out.getvalue())
+                    self.assertEqual(list((Path(d) / "approvals" / "pending").glob("*.json")), [])
+                    err, out = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        code = run.main(["--workdir", d, "--task", task, "--no-json"])
+                    self.assertEqual(code, 3, bad)
+                    self.assertIn("refusing:", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+                    self.assertNotIn("status=completed", out.getvalue())
+                    err, out = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        code = demo.main(["--scenario", "blocked"])
+                    self.assertEqual(code, 3, bad)
+                    self.assertIn("refusing:", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+                    self.assertNotIn("ephemeral", out.getvalue())
+                    self.assertNotIn(bad, err.getvalue())
+                self.assertFalse((Path(d) / "mock_outbox" / "effects.jsonl").exists())
+        finally:
+            if old is None: os.environ.pop("JARVIS_APPROVAL_KEY", None)
+            else: os.environ["JARVIS_APPROVAL_KEY"] = old
+
+    def test_ttl_is_validated_before_the_request_is_shown(self):
+        from jarvis_workforce import approve, run
+        root = Path(__file__).resolve().parents[1]
+        task = str(root / "examples" / "tasks" / "research_and_email.json")
+        old = os.environ.pop("JARVIS_APPROVAL_KEY", None)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                os.environ["JARVIS_APPROVAL_KEY"] = "k" * 32
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(run.main(["--workdir", d, "--task", task, "--no-json"]), 10)
+                pending = Path(d) / "approvals" / "pending"
+                for bad in ("0", "-5", "4000", "abc"):
+                    err, out = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        with self.assertRaises(SystemExit) as cm:
+                            approve.main(["--workdir", d, "--run", "demo-email-001", "--yes", "--ttl", bad])
+                    self.assertEqual(cm.exception.code, 2, bad)
+                    self.assertNotIn("Traceback", err.getvalue())
+                    self.assertIn("ttl", err.getvalue())
+                    self.assertNotIn("action:", out.getvalue())
+                    self.assertNotIn("request_sha256", out.getvalue())
+                self.assertEqual(list(pending.glob("*.json")), [])
+                for ttl in ("1", "3600"):
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(approve.main(["--workdir", d, "--run", "demo-email-001", "--yes", "--ttl", ttl]), 0)
+                deltas = sorted(json.loads(p.read_text())["expires_at"] - json.loads(p.read_text())["issued_at"]
+                                for p in pending.glob("*.json"))
+                self.assertEqual(deltas, [1, 3600])
+        finally:
+            if old is None: os.environ.pop("JARVIS_APPROVAL_KEY", None)
+            else: os.environ["JARVIS_APPROVAL_KEY"] = old
 
 
 if __name__ == "__main__":

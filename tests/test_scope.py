@@ -66,7 +66,8 @@ class ScopedWorkflow(WorkflowCase):
         from jarvis_workforce.gate import request_sha256  # noqa: F401
         # issue an approval for what the gate would see; still refused because the agent may never do it
         draft = [e for e in self.events("t-email-1") if e["event"] == "step_completed" and e["step"] == "write"][0]
-        self.store.issue("send_email", {"to": "reviewer@example.com", "subject": "Draft", "body": draft["output"]["content"]})
+        self.store.issue("send_email", {"to": "reviewer@example.com", "subject": "Draft", "body": draft["output"]["content"]},
+                         run_id="t-email-1", task_id="t-email-1")
         self.assertEqual(o.run(email_task()).status, "blocked")
         self.assertEqual(self.toolbox.effects(), [])
 

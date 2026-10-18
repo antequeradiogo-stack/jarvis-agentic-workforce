@@ -30,7 +30,7 @@ class AllowPath(WorkflowCase):
         o = self.make(); t = email_task()
         self.assertEqual(o.run(t).status, "blocked")
         req = self.last_approval_request("t-email-1")
-        self.store.issue(req["action"], req["params"], ttl=60)
+        self.issue_for(req)
         r = o.run(t)
         self.assertEqual((r.status, r.kind), ("completed", "simulated"))
         self.assertEqual(len(self.toolbox.effects()), 1)
@@ -41,9 +41,10 @@ class DenyPath(WorkflowCase):
     def test_consequential_actions_denied_without_approval(self):
         g = Gate(self.store)
         for action in ("send_email", "publish", "purchase", "delete_everything", "deploy"):
-            d = g.check(action, {"x": 1})
+            d = g.check(action, {"x": 1}, run_id="run-1", task_id="task-1")
             self.assertFalse(d.allowed, action)
             self.assertIn("default deny", d.reason)
+            self.assertIn("no approval", d.reason)
 
     def test_gate_without_store_denies(self):
         self.assertFalse(Gate(None).check("send_email", {}).allowed)
@@ -58,7 +59,8 @@ class DenyPath(WorkflowCase):
     def test_approval_for_different_params_does_not_apply(self):
         o = self.make(); o.run(email_task())
         req = self.last_approval_request("t-email-1")
-        self.store.issue("send_email", {**req["params"], "to": "other@example.com"}, ttl=60)
+        self.store.issue("send_email", {**req["params"], "to": "other@example.com"}, ttl=60,
+                         run_id=req["run_id"], task_id=req["task_id"])
         self.assertEqual(o.run(email_task()).status, "blocked")
         self.assertEqual(self.toolbox.effects(), [])
 
@@ -77,7 +79,8 @@ class ForgedApproval(WorkflowCase):
     def test_approval_signed_with_wrong_key_rejected(self):
         o = self.make(); o.run(email_task())
         req = self.last_approval_request("t-email-1")
-        ApprovalStore(self.work / "approvals", secrets.token_bytes(32)).issue(req["action"], req["params"])
+        ApprovalStore(self.work / "approvals", secrets.token_bytes(32)).issue(
+            req["action"], req["params"], run_id=req["run_id"], task_id=req["task_id"])
         r = o.run(email_task())
         self.assertEqual(r.status, "blocked")
         self.assertIn("bad signature", r.reason)
@@ -138,9 +141,32 @@ class RetriesAndErrors(WorkflowCase):
     def test_transient_delivery_failure_retried_same_idempotency_key(self):
         o = self.make(faults={"send_email": 1}); o.run(email_task())
         req = self.last_approval_request("t-email-1")
-        self.store.issue(req["action"], req["params"], ttl=60)
+        self.issue_for(req)
         self.assertEqual(o.run(email_task()).status, "completed")
         self.assertEqual(len(self.toolbox.effects()), 1)
+
+
+class CrossRun(WorkflowCase):
+    def test_approval_for_one_run_is_not_valid_for_another_run_of_the_same_task(self):
+        o = self.make()
+        t = email_task()
+        self.assertEqual(o.run(t, run_id="run-A").status, "blocked")
+        self.assertEqual(o.run(t, run_id="run-B").status, "blocked")
+        req_a = self.last_approval_request("run-A")
+        req_b = self.last_approval_request("run-B")
+        self.assertEqual(req_a["task_id"], req_b["task_id"])
+        self.assertEqual(req_a["params"], req_b["params"])
+        self.assertNotEqual(req_a["run_id"], req_b["run_id"])
+        self.assertNotEqual(req_a["request_sha256"], req_b["request_sha256"])
+        self.issue_for(req_a)
+        self.assertEqual(o.run(t, run_id="run-B").status, "blocked")
+        self.assertEqual(self.toolbox.effects(), [])
+        self.assertEqual(len(list((self.work / "approvals" / "pending").glob("*.json"))), 1)
+        self.assertEqual(o.run(t, run_id="run-A").status, "completed")
+        self.assertEqual(len(self.toolbox.effects()), 1)
+        self.assertEqual(o.run(t, run_id="run-A").status, "completed")
+        self.assertEqual(len(self.toolbox.effects()), 1)
+        self.assertEqual(list((self.work / "approvals" / "pending").glob("*.json")), [])
 
 
 class Models(WorkflowCase):

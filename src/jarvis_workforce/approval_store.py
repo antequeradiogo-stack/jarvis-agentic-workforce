@@ -6,9 +6,10 @@ Layout under ``root``:
   used_nonces.txt        append-only, fsync'd; checked on every consume (replay protection)
   .lock                  fcntl lock serialising consume()
 
-An approval is bound to sha256(canonical(action, params)), so changing any parameter invalidates it.
+An approval is bound to sha256(canonical(action, params, run_id, task_id)), so changing any parameter,
+or presenting it for a different run or task, invalidates it. It is single-use.
 consume() fails closed on: bad JSON, missing/extra fields, wrong version, bad signature (tamper or wrong key),
-expired / issued in the future / TTL above max, nonce already used.
+a different run or task, expired / issued in the future / TTL above max, nonce already used.
 
 HONEST LIMIT: HMAC is symmetric. Any process that can read the key can mint approvals, so this stops accidental
 and automated actions and leaves an audit trail; it is not a boundary against a malicious process running as the
@@ -21,8 +22,8 @@ from pathlib import Path
 
 from .gate import request_sha256
 
-VERSION = 1
-FIELDS = ("v", "action", "request_sha256", "nonce", "issued_at", "expires_at", "approver")
+VERSION = 2
+FIELDS = ("v", "action", "run_id", "task_id", "request_sha256", "nonce", "issued_at", "expires_at", "approver")
 MAX_TTL = 3600
 MIN_KEY_BYTES = 32
 
@@ -51,11 +52,16 @@ class ApprovalStore:
         self._used.touch(exist_ok=True)
 
     # ---------- issuing (the human-approval step; see approve.py CLI) ----------
-    def issue(self, action: str, params: dict, ttl: int = 600, approver: str = "user", now: float | None = None) -> dict:
+    def issue(self, action: str, params: dict, ttl: int = 600, approver: str = "user", now: float | None = None, *,
+              run_id: str | None = None, task_id: str | None = None) -> dict:
+        problem = _identity_problem(run_id, task_id)
+        if problem:
+            raise ApprovalError(problem)
         if not 0 < ttl <= self.max_ttl:
             raise ApprovalError(f"ttl must be in (0, {self.max_ttl}]")
         t = time.time() if now is None else now
-        body = {"v": VERSION, "action": action, "request_sha256": request_sha256(action, params),
+        body = {"v": VERSION, "action": action, "run_id": run_id, "task_id": task_id,
+                "request_sha256": request_sha256(action, params, run_id=run_id, task_id=task_id),
                 "nonce": secrets.token_hex(16), "issued_at": t, "expires_at": t + ttl, "approver": approver}
         body["sig"] = sign(self._key, body)
         tmp = self.pending / f".{body['nonce']}.tmp"
@@ -64,7 +70,7 @@ class ApprovalStore:
         return body
 
     # ---------- verification ----------
-    def _verify(self, body: dict, req_sha: str, now: float) -> str | None:
+    def _verify(self, body: dict, req_sha: str, now: float, run_id: str, task_id: str) -> str | None:
         """Return None if valid for this request, else the reason."""
         if not isinstance(body, dict) or set(body) != set(FIELDS) | {"sig"}:
             return "malformed approval (fields)"
@@ -72,6 +78,10 @@ class ApprovalStore:
             return "unsupported approval version"
         if not isinstance(body["sig"], str) or not hmac.compare_digest(sign(self._key, body), body["sig"]):
             return "bad signature (tampered or wrong key)"
+        if not isinstance(body["run_id"], str) or not isinstance(body["task_id"], str):
+            return "malformed approval (identity)"
+        if body["run_id"] != run_id or body["task_id"] != task_id:
+            return "approval bound to a different run or task"
         if body["request_sha256"] != req_sha:
             return "approval bound to a different request"
         if not all(isinstance(body[k], (int, float)) for k in ("issued_at", "expires_at")):
@@ -98,10 +108,14 @@ class ApprovalStore:
             finally:
                 fcntl.flock(lf, fcntl.LOCK_UN)
 
-    def consume(self, action: str, params: dict, now: float | None = None) -> tuple[bool, str]:
-        """Find and atomically consume a valid approval for exactly this request. Returns (ok, reason)."""
+    def consume(self, action: str, params: dict, now: float | None = None, *,
+                run_id: str | None = None, task_id: str | None = None) -> tuple[bool, str]:
+        """Find and atomically consume a valid approval for exactly this run, task and request. Returns (ok, reason)."""
+        problem = _identity_problem(run_id, task_id)
+        if problem:
+            return False, problem
         t = time.time() if now is None else now
-        req = request_sha256(action, params)
+        req = request_sha256(action, params, run_id=run_id, task_id=task_id)
         reasons = []
         with self._locked():
             for p in sorted(self.pending.glob("*.json")):
@@ -111,8 +125,8 @@ class ApprovalStore:
                     reasons.append("unreadable approval file")
                     continue
                 if isinstance(body, dict) and body.get("request_sha256") != req:
-                    continue  # approval for some other request: not relevant
-                why = self._verify(body, req, t)
+                    continue  # approval for some other request: not relevant, and not consumed
+                why = self._verify(body, req, t, run_id, task_id)
                 if why:
                     reasons.append(why)
                     continue
@@ -128,9 +142,21 @@ class ApprovalStore:
 KEY_ENV = "JARVIS_APPROVAL_KEY"
 
 
+def _identity_problem(run_id, task_id) -> str | None:
+    if isinstance(run_id, str) and run_id.strip() and isinstance(task_id, str) and task_id.strip():
+        return None
+    return "approval must be bound to a non-empty run_id and task_id"
+
+
 def _decode_key(v: str) -> bytes:
     v = v.strip()
-    key = bytes.fromhex(v[4:]) if v.startswith("hex:") else v.encode()
+    if v.startswith("hex:"):
+        try:
+            key = bytes.fromhex(v[4:])
+        except ValueError:
+            raise ApprovalError(f"{KEY_ENV} hex value is not valid hexadecimal") from None
+    else:
+        key = v.encode()
     if len(key) < MIN_KEY_BYTES:
         raise ApprovalError(f"{KEY_ENV} must be >= {MIN_KEY_BYTES} bytes")
     return key
