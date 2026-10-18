@@ -32,14 +32,16 @@ class StepFailed(Exception):
 class ToolContext:
     """What an agent is allowed to touch: gate-checked tool calls, each one logged."""
 
-    def __init__(self, agent: str, gate: Gate, toolbox: ToolBox, log: RunLog, forbidden=()):
+    def __init__(self, agent: str, gate: Gate, toolbox: ToolBox, log: RunLog, forbidden=(),
+                 run_id: str | None = None, task_id: str | None = None):
         self.agent, self.gate, self.toolbox, self.log, self.forbidden = agent, gate, toolbox, log, set(forbidden)
+        self.run_id, self.task_id = run_id, task_id
 
     def call(self, action: str, params: dict):
         if action in self.forbidden:
             self.log.write("tool_denied", agent=self.agent, action=action, reason="forbidden for this agent")
             raise ToolDenied(f"{self.agent}: {action} is forbidden for this agent")
-        d = self.gate.check(action, params)
+        d = self.gate.check(action, params, run_id=self.run_id, task_id=self.task_id)
         if not d.allowed:
             self.log.write("tool_denied", agent=self.agent, action=action, reason=d.reason)
             raise ToolDenied(d.reason)
@@ -124,11 +126,12 @@ class Orchestrator:
         if task.deliver is not None:
             params = {**task.deliver.params, "body": outputs["write"].content}
             try:
-                eff = self._deliver(log, run_id, task.deliver.action, params)
+                eff = self._deliver(log, run_id, task.deliver.action, params, task.task_id)
                 if eff is not None:
                     effects.append(eff)
             except ToolDenied as e:
-                blocked.append({"action": task.deliver.action, "request_sha256": request_sha256(task.deliver.action, params),
+                blocked.append({"action": task.deliver.action,
+                                "request_sha256": request_sha256(task.deliver.action, params, run_id=run_id, task_id=task.task_id),
                                 "reason": str(e)})
             except StepFailed as e:
                 return self._finish(log, Result(run_id, task.task_id, "failed", "draft", f"delivery failed: {e.reason}",
@@ -159,7 +162,8 @@ class Orchestrator:
             log.write("step_skipped", step=step, reason="already completed (checkpoint)")
             return out, done[-1]["artifact"]
         scope = self.scopes.get(agent_name)
-        ctx = ToolContext(agent_name, self.gate, self.toolbox, log, forbidden=scope.forbidden if scope else ())
+        ctx = ToolContext(agent_name, self.gate, self.toolbox, log, forbidden=scope.forbidden if scope else (),
+                          run_id=run_id, task_id=task.task_id)
         last = "unknown"
         for attempt in range(1, self.max_retries + 1):
             log.write("step_started", step=step, agent=agent_name, attempt=attempt)
@@ -190,8 +194,8 @@ class Orchestrator:
         raise StepFailed(f"{step}: retries exhausted ({last})")
 
     # ---------- consequential delivery: gate + idempotency ----------
-    def _deliver(self, log, run_id, action, params):
-        sha = request_sha256(action, params)
+    def _deliver(self, log, run_id, action, params, task_id: str):
+        sha = request_sha256(action, params, run_id=run_id, task_id=task_id)
         key = hashlib.sha256(f"{run_id}|deliver|{sha}".encode()).hexdigest()[:32]
         committed = log.find("effect_committed", idempotency_key=key)
         if committed:
@@ -206,10 +210,10 @@ class Orchestrator:
         if writer_scope is not None and action in writer_scope.forbidden:
             log.write("gate_decision", action=action, allowed=False, reason="forbidden for this agent")
             raise ToolDenied(f"{action} is forbidden for the writer agent")
-        d = self.gate.check(action, params)
+        d = self.gate.check(action, params, run_id=run_id, task_id=task_id)
         log.write("gate_decision", action=action, allowed=d.allowed, reason=d.reason, request_sha256=sha)
         if not d.allowed:
-            log.write("approval_required", action=action, params=params, request_sha256=sha)
+            log.write("approval_required", action=action, params=params, request_sha256=sha, task_id=task_id)
             raise ToolDenied(d.reason)
         last = ""
         for attempt in range(1, self.max_retries + 1):

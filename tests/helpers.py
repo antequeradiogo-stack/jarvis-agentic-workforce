@@ -43,3 +43,7 @@ class WorkflowCase(unittest.TestCase):
 
     def last_approval_request(self, run_id):
         return [e for e in self.events(run_id) if e["event"] == "approval_required"][-1]
+
+    def issue_for(self, req, **kw):
+        kw.setdefault("ttl", 60)
+        return self.store.issue(req["action"], req["params"], run_id=req["run_id"], task_id=req["task_id"], **kw)

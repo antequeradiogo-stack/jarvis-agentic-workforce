@@ -10,7 +10,7 @@ uses synthetic data and mocks only.
 | Idea from the prototype | Here | How it was treated |
 |---|---|---|
 | A single policy enforcement point; default deny; unknown actions are consequential; approval-like fields in task data count as spoofing | `gate.py` | rebuilt |
-| Human approvals bound to a request hash, expiring, single-use, signed | `approval_store.py` | rebuilt (generic, HMAC; asymmetric signing is planned) |
+| Human approvals bound to a request hash (action, params, run and task), expiring, single-use, signed | `approval_store.py` | rebuilt (generic, HMAC; asymmetric signing is planned) |
 | A task-text classifier that treats text as data and normalises obfuscation (homoglyphs, leetspeak, spacing) | `policy.py` | ported, generalised, personal/channel-specific strings removed |
 | Per-agent folder isolation and forbidden actions | `scope.py` | ported, deployment-specific paths and config loading removed |
 | Running tests with the network blocked | `scripts/run_offline.sh` | rebuilt (netns + Python socket guard; the prototype's seccomp layer was not carried over) |

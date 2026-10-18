@@ -57,12 +57,69 @@ class ToolBox:
 
     # ---------- mock side effects ----------
     def effects(self) -> list[dict]:
+        """Committed effects. A torn final line (crash mid-write) is ignored.
+
+        An earlier undecodable line is not ignored: skipping it could hide a real effect and
+        a later send would duplicate it. Only the incomplete tail can be a torn append.
+        """
         if not self.effects_file.exists():
             return []
-        return [json.loads(l) for l in self.effects_file.read_text().splitlines() if l.strip()]
+        lines = self.effects_file.read_text(encoding="utf-8").splitlines()
+        last = -1
+        for i, line in enumerate(lines):
+            if line.strip():
+                last = i
+        out = []
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                if i == last:
+                    continue
+                raise
+        return out
 
     def lookup_effect(self, idempotency_key: str) -> dict | None:
         return next((e for e in self.effects() if e["idempotency_key"] == idempotency_key), None)
+
+    def _drop_torn_tail(self) -> None:
+        """Remove an incomplete trailing line so the next append cannot glue onto it.
+
+        A complete record, with or without a final newline, is left in place. Complete lines
+        above a torn tail are kept, so a finished effect is never deleted and never re-sent.
+        """
+        if not self.effects_file.exists():
+            return
+        data = self.effects_file.read_bytes()
+        if not data or data.endswith(b"\n"):
+            return
+        nl = data.rfind(b"\n")
+        tail = data[nl + 1:]
+        try:
+            json.loads(tail.decode("utf-8"))
+            return
+        except (UnicodeDecodeError, ValueError):
+            pass
+        kept = b"" if nl < 0 else data[:nl + 1]
+        tmp = self.effects_file.with_name(".effects.jsonl.tmp")
+        with open(tmp, "wb") as f:
+            f.write(kept); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, self.effects_file)
+
+    def _append_effect_line(self, line: str) -> None:
+        self._drop_torn_tail()
+        payload = line.encode("utf-8") + b"\n"
+        # r+b so the last byte can be inspected; append mode ("ab") refuses reads.
+        mode = "r+b" if self.effects_file.exists() else "w+b"
+        with open(self.effects_file, mode) as f:
+            end = f.seek(0, os.SEEK_END)
+            if end:
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    f.write(b"\n")
+            f.write(payload); f.flush(); os.fsync(f.fileno())
 
     def _effect(self, action: str, params: dict, key: str) -> dict:
         prior = self.lookup_effect(key)
@@ -70,8 +127,7 @@ class ToolBox:
             return {**prior, "deduped": True}
         eff = {"effect_id": "mock-" + hashlib.sha256(key.encode()).hexdigest()[:12], "action": action,
                "idempotency_key": key, "params": params, "simulated": True}
-        with open(self.effects_file, "a") as f:
-            f.write(json.dumps(eff, sort_keys=True) + "\n"); f.flush(); os.fsync(f.fileno())
+        self._append_effect_line(json.dumps(eff, sort_keys=True))
         return {**eff, "deduped": False}
 
 

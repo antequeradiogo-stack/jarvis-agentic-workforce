@@ -25,7 +25,8 @@ All of this is implemented and covered by tests unless marked **[planned]**.
 ## Gate (PEP)
 Order of checks: approval-like keys anywhere in params → deny (spoofing). Then the safe allow-list (`list_docs`,
 `read_doc`, `summarize`) → allow. Anything else → consume a matching approval or deny. Unknown actions are
-labelled `unregistered:` and denied unless an approval exists for that exact request.
+labelled `unregistered:` and denied unless an approval exists for that exact request: the action, its parameters,
+and the run and task it belongs to.
 
 ## Run log = audit trail + checkpoint
 `runs/<run_id>/events.jsonl`, one fsync'd JSON object per line (`seq`, `ts`, `run_id`, `event`, fields). A torn last
@@ -34,6 +35,10 @@ line is ignored. On restart:
 - `effect_committed` → the side effect is skipped
 - effect present in the mock outbox but not committed (crash between execution and logging) → adopted as
   `recovered`; it is **not** re-sent and needs no new approval
+- approval already consumed, but no complete effect line yet (crash between the gate and the outbox write) →
+  **blocked**; a fresh approval is required, and the side effect is not repeated
+- a torn final line in the mock outbox is ignored. Only that incomplete tail is skipped, so a completed effect
+  is never hidden and never sent again
 - `run_finished` with a non-blocked status → the stored result is returned (idempotent)
 - the same `run_id` with a different task → refused, so checkpoints are never mixed
 

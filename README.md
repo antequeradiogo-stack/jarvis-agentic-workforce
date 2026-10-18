@@ -8,14 +8,15 @@ also available as an asciicast: `docs/media/demo.cast`.</sub>
 An offline, test-first multi-agent orchestrator built with safety from the start. An orchestrator hands a task to
 mock **researcher** and **writer** agents. **Every tool call passes a default-deny gate.** Consequential actions
 (send email, publish, purchase) need a **single-use, expiring, HMAC-signed human approval** bound to the exact
-request. Every agent output is validated as untrusted. Every decision goes to a JSON-lines log, which also serves
+request: the action, its parameters, and the run and task it belongs to. Every agent output is validated as
+untrusted. Every decision goes to a JSON-lines log, which also serves
 as the **checkpoint**: a crashed run resumes without repeating work or side effects.
 
 It is a clean, public rebuild of patterns from an earlier private prototype. Two small, generic components (the
 intake classifier and per-agent scope) were adapted from it. No data, logs, prompts, credentials or configuration
 from the prototype are included; see `docs/design-lineage.md`.
 
-> **Status (v0.2.0):** Phases 1-3 are implemented and tested: 73 tests, all offline. Everything runs on **mock
+> **Status (v0.2.0):** Phases 1-3 are implemented and tested: 83 tests, all offline. Everything runs on **mock
 > agents (no LLM)**, **mock tools** and a **synthetic corpus**. Nothing is deployed, nothing touches a real
 > account, and the package contains no network code. Real LLM backends and AWS deployment are **planned**
 > (`docs/roadmap.md`).
@@ -67,7 +68,7 @@ flowchart TD
 | Area | Module | Tests |
 |---|---|---|
 | Orchestrator: researcher → writer → optional delivery, status machine | `orchestrator.py` | `test_workflow.py` |
-| Default-deny gate, request hash binding, spoofing detection | `gate.py` | `test_workflow.py` |
+| Default-deny gate, request hash binding (action, params, run, task), spoofing detection | `gate.py` | `test_workflow.py` |
 | Approval store: HMAC-SHA256, single-use nonce, expiry, tamper/replay/wrong-key rejection, file lock | `approval_store.py` | `test_approvals.py` |
 | Key from env or `.env` (must be mode 0600), fail closed | `approval_store.load_key` | `test_approvals.py` |
 | Validated models (task, agent output, result) | `models.py` | `test_workflow.py` |
@@ -86,7 +87,7 @@ See `docs/roadmap.md`.
 ## Layout
 ```
 src/jarvis_workforce/   orchestrator, gate, approval_store, models, agents, tools, runlog, policy, scope, demo/run/approve CLIs
-tests/                  unittest suite (73 tests)
+tests/                  unittest suite (83 tests)
 examples/               synthetic corpus (4 notes) + task files
 scripts/                run_offline.sh, test.sh, demo.sh, record_demo.py (README GIF), offline/sitecustomize.py (socket guard)
 docs/media/             demo.gif, demo.cast, demo_frame.png

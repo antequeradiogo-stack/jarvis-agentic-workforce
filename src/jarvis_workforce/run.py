@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse, json, sys
 from pathlib import Path
 
-from .approval_store import ApprovalStore, load_key
+from .approval_store import ApprovalError, ApprovalStore, load_key
 from .demo import CORPUS, ROOT, echo
 from .gate import Gate
 from .orchestrator import Orchestrator
@@ -37,7 +37,12 @@ def main(argv=None) -> int:
     ap.add_argument("--run-id")
     ap.add_argument("--no-json", action="store_true", help="print only the trace, not the result JSON")
     a = ap.parse_args(argv)
-    res = build(Path(a.workdir)).run(json.loads(Path(a.task).read_text()), run_id=a.run_id)
+    try:
+        orch = build(Path(a.workdir))
+    except ApprovalError as e:
+        print(f"refusing: {e}", file=sys.stderr)
+        return 3
+    res = orch.run(json.loads(Path(a.task).read_text()), run_id=a.run_id)
     if not a.no_json:
         print(json.dumps(res.to_dict(), indent=2))
     return {"completed": 0, "blocked": 10, "failed": 1, "rejected": 2}[res.status]

@@ -6,7 +6,7 @@ Rules (in order):
 2. Action on the explicit SAFE allow-list (read/summarise, reversible, in-sandbox) -> ALLOW.
 3. Anything else (send_email, publish, purchase, and every unknown action) is consequential -> ALLOW only if the
    approval store holds a valid, unexpired, unused, HMAC-signed approval bound to this exact request
-   (sha256 of canonical action + params), which is consumed atomically. Otherwise DENY.
+   (sha256 of canonical action + params + run_id + task_id), which is consumed atomically. Otherwise DENY.
 """
 from __future__ import annotations
 import hashlib, json
@@ -28,12 +28,17 @@ class Decision:
     request_sha256: str
 
 
-def canonical(action: str, params: dict) -> str:
-    return json.dumps({"action": action, "params": params}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+def canonical(action: str, params: dict, *, run_id: str | None = None, task_id: str | None = None) -> str:
+    body = {"action": action, "params": params}
+    if run_id is not None:
+        body["run_id"] = run_id
+    if task_id is not None:
+        body["task_id"] = task_id
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def request_sha256(action: str, params: dict) -> str:
-    return hashlib.sha256(canonical(action, params).encode()).hexdigest()
+def request_sha256(action: str, params: dict, *, run_id: str | None = None, task_id: str | None = None) -> str:
+    return hashlib.sha256(canonical(action, params, run_id=run_id, task_id=task_id).encode()).hexdigest()
 
 
 def find_approval_claims(obj: Any, path: str = "$", depth: int = 0) -> list[str]:
@@ -55,8 +60,9 @@ class Gate:
     def __init__(self, approval_store=None):
         self.approval_store = approval_store
 
-    def check(self, action: str, params: dict, now: float | None = None) -> Decision:
-        sha = request_sha256(action, params) if isinstance(params, dict) else "-"
+    def check(self, action: str, params: dict, now: float | None = None, *,
+              run_id: str | None = None, task_id: str | None = None) -> Decision:
+        sha = request_sha256(action, params, run_id=run_id, task_id=task_id) if isinstance(params, dict) else "-"
         if not isinstance(action, str) or not isinstance(params, dict):
             return Decision(False, "malformed tool call", sha)
         claims = find_approval_claims(params)
@@ -67,7 +73,7 @@ class Gate:
         label = action if action in KNOWN_CONSEQUENTIAL else f"unregistered:{action}"
         if self.approval_store is None:
             return Decision(False, f"default deny: {label} needs approval and no approval store is configured", sha)
-        ok, why = self.approval_store.consume(action, params, now=now)
+        ok, why = self.approval_store.consume(action, params, now=now, run_id=run_id, task_id=task_id)
         if not ok:
             return Decision(False, f"default deny: {label}: {why}", sha)
         return Decision(True, f"approved: {why}", sha)

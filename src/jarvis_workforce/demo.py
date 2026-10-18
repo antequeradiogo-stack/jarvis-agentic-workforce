@@ -10,7 +10,7 @@ import argparse, json, secrets, shutil, sys, tempfile
 from pathlib import Path
 
 from .agents import MockWriter, ScriptedAgent, MockResearcher
-from .approval_store import ApprovalStore, load_key
+from .approval_store import ApprovalError, ApprovalStore, load_key
 from .gate import Gate
 from .orchestrator import Orchestrator, SimulatedCrash
 from .policy import intake_check
@@ -90,14 +90,15 @@ def s_blocked_and_approve(work, key, approve: bool):
     header("3. user approves that exact request (HMAC-signed, single-use, 10 min), run resumes")
     req = env.orch.run_dir(t["task_id"]) / "events.jsonl"
     ev = [json.loads(l) for l in req.read_text().splitlines() if '"approval_required"' in l][-1]
-    a = env.store.issue(ev["action"], ev["params"], ttl=600, approver="demo-user")
+    a = env.store.issue(ev["action"], ev["params"], ttl=600, approver="demo-user",
+                        run_id=ev["run_id"], task_id=ev["task_id"])
     print(f"   approval issued: nonce={a['nonce'][:8]} bound to {a['request_sha256'][:16]}... expires in 600s")
     env.orch.run(t)
     print(f"   mock outbox now holds {len(env.toolbox.effects())} email(s)")
     header("3b. replay: the consumed approval file is copied back into pending/ -> refused")
     for c in (work / "s2" / "approvals" / "consumed").glob("*.json"):
         shutil.copy(c, work / "s2" / "approvals" / "pending" / c.name)
-    print(f"   gate says: {env.orch.gate.check(ev['action'], ev['params']).reason}")
+    print(f"   gate says: {env.orch.gate.check(ev['action'], ev['params'], run_id=ev['run_id'], task_id=ev['task_id']).reason}")
 
 
 def s_forged(work, key):
@@ -112,14 +113,15 @@ def s_forged(work, key):
     env.orch.run(t)
     ev = [json.loads(l) for l in (env.orch.run_dir("demo-forged-002") / "events.jsonl").read_text().splitlines()
           if '"approval_required"' in l][-1]
-    ApprovalStore(work / "s4" / "approvals", secrets.token_bytes(32)).issue(ev["action"], ev["params"], approver="attacker")
-    print(f"   gate says: {env.orch.gate.check(ev['action'], ev['params']).reason}")
+    ApprovalStore(work / "s4" / "approvals", secrets.token_bytes(32)).issue(
+        ev["action"], ev["params"], approver="attacker", run_id=ev["run_id"], task_id=ev["task_id"])
+    print(f"   gate says: {env.orch.gate.check(ev['action'], ev['params'], run_id=ev['run_id'], task_id=ev['task_id']).reason}")
     for p in (work / "s4" / "approvals" / "pending").glob("*.json"):
         p.unlink()
-    a = env.store.issue(ev["action"], ev["params"], ttl=60)
+    a = env.store.issue(ev["action"], ev["params"], ttl=60, run_id=ev["run_id"], task_id=ev["task_id"])
     p = work / "s4" / "approvals" / "pending" / f"{a['nonce']}.json"
     body = json.loads(p.read_text()); body["expires_at"] += 86400; p.write_text(json.dumps(body))
-    print(f"   gate says: {env.orch.gate.check(ev['action'], ev['params']).reason}")
+    print(f"   gate says: {env.orch.gate.check(ev['action'], ev['params'], run_id=ev['run_id'], task_id=ev['task_id']).reason}")
 
 
 def s_faults(work, key):
@@ -137,7 +139,7 @@ def s_crash(work, key):
     env.orch.run(t)
     ev = [json.loads(l) for l in (env.orch.run_dir(t["task_id"]) / "events.jsonl").read_text().splitlines()
           if '"approval_required"' in l][-1]
-    env.store.issue(ev["action"], ev["params"], ttl=600)
+    env.store.issue(ev["action"], ev["params"], ttl=600, run_id=ev["run_id"], task_id=ev["task_id"])
     try:
         env.orch.run(t)
     except SimulatedCrash as c:
@@ -164,9 +166,13 @@ def main(argv=None) -> int:
     ap.add_argument("--workdir", help="keep run files here instead of a temp dir")
     a = ap.parse_args(argv)
     try:
-        key, src = load_key(ROOT), "JARVIS_APPROVAL_KEY"
+        key = load_key(ROOT)
+        src = "JARVIS_APPROVAL_KEY"
     except KeyError:
         key, src = secrets.token_bytes(32), "ephemeral random key (not stored)"
+    except ApprovalError as e:
+        print(f"refusing: {e}", file=sys.stderr)
+        return 3
     print(f"approval key source: {src}")
     work = Path(a.workdir) if a.workdir else Path(tempfile.mkdtemp(prefix="jarvis-demo-"))
     try:

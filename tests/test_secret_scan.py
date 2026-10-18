@@ -1,5 +1,9 @@
-"""Sanity/secret scan: the repository tree must contain no secrets, private data or runtime artifacts."""
-import re, unittest
+"""Sanity/secret scan: tracked and unignored files must contain no secrets, private data or runtime artifacts.
+
+Gitignored runtime output (``var/``, ``*.jsonl``, ``.env``) is outside the scan. Untracked files that are not
+ignored are still scanned, so a secret dropped in the working tree is still caught.
+"""
+import re, subprocess, unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,10 +28,24 @@ FORBIDDEN_FILES = {".env", "id_rsa", "id_ed25519", "credentials.json", "used_non
 BINARY_MEDIA = {".gif", ".png", ".jpg", ".jpeg", ".webp"}  # random bytes cause false text matches; checked separately
 
 
-def all_files():
-    for p in ROOT.rglob("*"):
-        if p.is_file() and not (set(p.relative_to(ROOT).parts) & SKIP_DIRS):
+def repo_paths():
+    """Tracked files plus untracked files that are not gitignored."""
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=ROOT, check=True, capture_output=True)
+    for rel in listed.stdout.split(b"\0"):
+        if not rel:
+            continue
+        rel_s = rel.decode("utf-8", "surrogateescape")
+        if set(Path(rel_s).parts) & SKIP_DIRS:
+            continue
+        p = ROOT / rel_s
+        if p.is_file():
             yield p
+
+
+def all_files():
+    yield from repo_paths()
 
 
 def files():
@@ -67,6 +85,47 @@ class SecretScan(unittest.TestCase):
     def test_scanner_detects_planted_secret(self):
         planted = "AK" + "IA" + "ABCDEFGHIJKLMNOP"
         self.assertTrue(re.search(PATTERNS["aws_access_key"], planted))
+
+    def test_scan_ignores_gitignored_runtime_output(self):
+        planted = "AK" + "IA" + "ABCDEFGHIJKLMNOP"
+        runtime = ROOT / "var" / "qa-scan"
+        effects = runtime / "mock_outbox" / "effects.jsonl"
+        events = runtime / "events.jsonl"
+        nonces = runtime / "used_nonces.txt"
+        probe = ROOT / "qa_untracked_probe.txt"
+        effects.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            effects.write_text(planted + "\n")
+            events.write_text("person@" + "gmail.com\n")
+            nonces.write_text("nonce\n")
+            probe.write_text(planted + "\n")
+            scanned = list(files())
+            scanned_set = {p.resolve() for p in scanned}
+            for skipped in (effects, events, nonces):
+                self.assertNotIn(skipped.resolve(), scanned_set)
+            self.assertIn(probe.resolve(), scanned_set)
+            self.assertIn((ROOT / "README.md").resolve(), scanned_set)
+            secret_hits, email_hits = [], []
+            for p in scanned:
+                text = p.read_text(errors="ignore")
+                for name, pat in PATTERNS.items():
+                    if re.search(pat, text):
+                        secret_hits.append(f"{p.relative_to(ROOT)}: {name}")
+                email_hits += [f"{p.relative_to(ROOT)}: {m.group(0)}" for m in EMAIL.finditer(text)
+                               if m.group(1).lower() not in ALLOWED_EMAIL_DOMAINS]
+            self.assertEqual(secret_hits, [f"{probe.relative_to(ROOT)}: aws_access_key"])
+            self.assertEqual(email_hits, [])
+        finally:
+            for p in (effects, events, nonces, probe):
+                if p.exists():
+                    p.unlink()
+            for d in (effects.parent, runtime, ROOT / "var"):
+                if d.is_dir():
+                    try:
+                        d.rmdir()
+                    except OSError:
+                        pass
+
 
 if __name__ == "__main__":
     unittest.main()

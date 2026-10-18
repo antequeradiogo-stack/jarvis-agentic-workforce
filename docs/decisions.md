@@ -18,11 +18,13 @@
 9. **The run log is the checkpoint.** A single append-only JSONL per run serves as both audit trail and recovery
    state. That is simpler than a separate DB, and each line is fsync'd.
 10. **The approval is consumed before the side effect.** A crash after consuming can waste an approval but can
-    never double-spend one. A crash after the effect but before the commit log is recovered from the outbox using
-    the idempotency key, without needing a new approval.
+    never double-spend one. Resume then returns blocked and needs a fresh approval. A crash after the effect but
+    before the commit log is recovered from the outbox using the idempotency key, without needing a new approval.
 11. **Permanent/unknown errors are not retried.** Only `TransientToolError` and malformed output are retried, with
     exponential backoff, so a bug is never hammered or masked.
 12. **Mocks, not an LLM, for now.** Deterministic agents make every safety property testable. An LLM backend is
     planned behind the same validation and gate.
 13. **Offline runner** prefers `unshare -rn` (true netns) and falls back to a Python socket guard. It reports which
     layers are active.
+14. **An approval is bound to the run and the task as well as the action and params.** The same task started under
+    two run ids is two requests. An approval for one is not consumed by the other, and it stays single-use.
