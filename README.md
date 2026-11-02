@@ -21,8 +21,11 @@ from the prototype are included; see `docs/design-lineage.md`.
 > account, and the package contains no network code. Real LLM backends and AWS deployment are **planned**
 > (`docs/roadmap.md`).
 
-## Quickstart (standard library only; tested on Linux with Python 3.13, code targets 3.10+)
+## Quickstart
+Standard library only, nothing to install. Needs Python 3.10+ and a POSIX shell (Linux, macOS or WSL); CI runs
+Python 3.10, 3.12 and 3.13. Full step-by-step setup, exit codes and troubleshooting: [`docs/setup.md`](docs/setup.md).
 ```bash
+git clone https://github.com/antequeradiogo-stack/jarvis-agentic-workforce.git && cd jarvis-agentic-workforce
 ./scripts/test.sh -v          # full suite, network-blocked (unshare -rn if available, plus a Python socket guard)
 ./scripts/demo.sh             # all demo scenarios with a readable run trace
 ./scripts/demo.sh --scenario crash     # research | blocked | approve | forged | faults | crash | injection
@@ -40,6 +43,7 @@ python3 -m jarvis_workforce.approve --workdir ./var --run demo-email-001 --yes  
 python3 -m jarvis_workforce.run     --workdir ./var --task examples/tasks/research_and_email.json   # resumes, mock email sent
 ```
 If no key is configured, the gate has no approval store and every consequential action is denied (fail closed).
+`run` exits 0 when completed, 10 when blocked on an approval, 1 on failure and 2 when the task is rejected.
 
 ## Architecture
 ### Who does what
@@ -125,9 +129,17 @@ tests/                  unittest suite (83 tests)
 examples/               synthetic corpus (4 notes) + task files
 scripts/                run_offline.sh, test.sh, demo.sh, record_demo.py (README GIF), offline/sitecustomize.py (socket guard)
 docs/media/             demo.gif, demo.cast, demo_frame.png
-docs/                   architecture, security, decisions, roadmap, design-lineage
+docs/                   setup, architecture, security, decisions, roadmap, design-lineage
 .github/workflows/      GitHub Actions: offline test suite + demo smoke run (Python 3.10/3.12/3.13)
 ```
+
+## Documentation
+- [`docs/setup.md`](docs/setup.md): setup, running the tests and demo, the approval flow, exit codes
+- [`docs/architecture.md`](docs/architecture.md): flow, gate, run log as checkpoint, components
+- [`docs/security.md`](docs/security.md): permissions model, controls and their limits
+- [`docs/decisions.md`](docs/decisions.md): design decisions and trade-offs
+- [`docs/roadmap.md`](docs/roadmap.md): planned work (real LLM backend, AWS deployment)
+- [`docs/design-lineage.md`](docs/design-lineage.md): what came from the earlier private prototype
 
 ## License
 MIT, see `LICENSE`.
