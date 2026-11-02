@@ -42,6 +42,40 @@ python3 -m jarvis_workforce.run     --workdir ./var --task examples/tasks/resear
 If no key is configured, the gate has no approval store and every consequential action is denied (fail closed).
 
 ## Architecture
+### Who does what
+The orchestrator is the coordinator: it owns the task, hands each step to a specialist agent and decides what
+happens next. Agents never call tools directly, and only a human can approve a consequential action.
+```mermaid
+flowchart LR
+    H([Human operator])
+    subgraph Coordinator
+        O[Orchestrator<br/>steps, retries, resume]
+    end
+    subgraph Specialists["Specialist agents (mock)"]
+        R[Researcher]
+        W[Writer]
+    end
+    subgraph Guards["Control points"]
+        P{Intake policy}
+        S{Agent scope}
+        G{Default-deny gate}
+    end
+    L[(Run log<br/>audit trail + checkpoint)]
+    A[(Approval store)]
+    X[Mock tools / outbox]
+    H -->|task JSON| P --> O
+    O -->|research step| R
+    O -->|write step| W
+    R & W -->|tool calls| S --> G
+    G -->|safe reads| X
+    G -->|consequential| A
+    H -->|approve CLI, signed and single-use| A
+    A -->|approval consumed| X
+    O -.every event.-> L
+    L -.resume after crash or approval.-> O
+```
+
+### Request flow
 ```mermaid
 flowchart TD
     T[Task JSON] --> V{TaskRequest<br/>strict schema}
