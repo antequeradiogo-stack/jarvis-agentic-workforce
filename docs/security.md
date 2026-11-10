@@ -30,6 +30,19 @@ configuration: the researcher may never send, publish or purchase; the writer ma
 - **TTL:** `approve --ttl` must be an integer from 1 to 3600 seconds. Anything else is rejected before the pending
   request is shown.
 
+## Workload control gate
+Checked before the approval gate, for every tool call and every model call (`control.py`):
+- **Registered job only:** the call must carry a `job_id` that is in the registry and `active`. No `job_id` means refuse.
+- **Allow-lists:** a tool or model that is not on the job's list is refused, and by default the job is stopped.
+- **Budget:** a model call reserves its worst case (prompt + `max_tokens`) with a conditional write. Over the
+  USD or token cap means refuse, and by default the job is stopped.
+- **Fail closed:** a missing, unreadable, corrupt or invalid registry refuses every call. An allow that cannot
+  be written to the audit log is refused.
+- **Stop delay:** at most the cache TTL (default 30 s, max 300 s) for tool calls; model calls re-check the
+  status in the reservation write. Automatic stops (budget, allow-list, 3 errors in a row) apply at once.
+- **Limit:** like the agent scope, this is an in-process check in this offline repo. On AWS the same rule is
+  enforced by IAM: only the gate role may invoke models (`docs/aws-control-plane.md`).
+
 ## Threat model
 | Threat | Mitigation | Status |
 |---|---|---|

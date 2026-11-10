@@ -2,15 +2,21 @@
 gate-checked, every agent output validated, retries with exponential backoff, and a JSON-lines run log that
 doubles as a checkpoint so a crashed or paused run resumes without repeating work or side effects.
 
-Run statuses: completed | blocked (a consequential action was denied; resumable after approval) |
-failed (retries exhausted / permanent error) | rejected (invalid or unsafe task, nothing ran)."""
+When a ``ControlGate`` is configured (see control.py), every model and tool call of the run must also belong to an
+active registered job: ``run(task, job_id=...)``. Agents never hold the model client; they ask ``ctx.complete()``.
+
+Run statuses: completed | blocked (a consequential action was denied, or the job was refused by the control gate;
+resumable after approval / job resume) | failed (retries exhausted / permanent error) | rejected (invalid or unsafe
+task, nothing ran)."""
 from __future__ import annotations
 import hashlib, json, time
 from pathlib import Path
 from typing import Callable
 
 from .agents import MockResearcher, MockWriter
+from .control import ControlDecision, ControlGate
 from .gate import Gate, request_sha256
+from .llm import MockModel
 from .models import AgentOutput, Result, TaskRequest, ValidationError
 from .runlog import RunLog
 from .tools import ToolBox, ToolError, TransientToolError
@@ -18,6 +24,10 @@ from .tools import ToolBox, ToolError, TransientToolError
 
 class ToolDenied(Exception):
     pass
+
+
+class JobRefused(ToolDenied):
+    """The workload control gate refused the call (job stopped/unknown, registry down, allow-list, budget)."""
 
 
 class SimulatedCrash(Exception):
@@ -30,24 +40,79 @@ class StepFailed(Exception):
 
 
 class ToolContext:
-    """What an agent is allowed to touch: gate-checked tool calls, each one logged."""
+    """What an agent is allowed to touch: gate-checked tool and model calls, each one logged.
+
+    Order for tools: agent scope (forbidden actions) -> workload control gate (job, allow-list, budget) ->
+    approval gate -> tool. Order for models: control gate (job, model allow-list, budget reservation) -> model.
+    Without a control gate (library/back-compat mode) only the scope and approval gate apply."""
 
     def __init__(self, agent: str, gate: Gate, toolbox: ToolBox, log: RunLog, forbidden=(),
-                 run_id: str | None = None, task_id: str | None = None):
+                 run_id: str | None = None, task_id: str | None = None, *, control: ControlGate | None = None,
+                 job_id: str | None = None, model: MockModel | None = None):
         self.agent, self.gate, self.toolbox, self.log, self.forbidden = agent, gate, toolbox, log, set(forbidden)
         self.run_id, self.task_id = run_id, task_id
+        self._control, self._job_id, self._model = control, job_id, model
+
+    def _control_tool(self, action: str) -> ControlDecision | None:
+        if self._control is None:
+            return None
+        c = self._control.authorize_tool(self._job_id, self.agent, action, run_id=self.run_id)
+        if not c.allowed:
+            self.log.write("control_refused", agent=self.agent, kind="tool", name=action, job_id=self._job_id,
+                           reason=c.reason)
+            raise JobRefused(f"control gate: {c.reason}")
+        return c
 
     def call(self, action: str, params: dict):
         if action in self.forbidden:
             self.log.write("tool_denied", agent=self.agent, action=action, reason="forbidden for this agent")
             raise ToolDenied(f"{self.agent}: {action} is forbidden for this agent")
+        c = self._control_tool(action)
         d = self.gate.check(action, params, run_id=self.run_id, task_id=self.task_id)
         if not d.allowed:
             self.log.write("tool_denied", agent=self.agent, action=action, reason=d.reason)
             raise ToolDenied(d.reason)
-        out = self.toolbox.call(action, params)
+        try:
+            out = self.toolbox.call(action, params)
+        except Exception as e:
+            if c is not None:
+                self._control.record_error(self._job_id, self.agent, "tool", action, f"{type(e).__name__}: {e}",
+                                           run_id=self.run_id)
+            raise
+        if c is not None:
+            self._control.record_usage(c, self.agent, run_id=self.run_id)
         self.log.write("tool_call", agent=self.agent, action=action, allowed=True, reason=d.reason)
         return out
+
+    def complete(self, prompt: str, *, focus: str = "", max_sentences: int = 2, max_tokens: int = 256) -> str:
+        """The only way an agent reaches a model. Returns the completion text."""
+        if self._model is None:
+            raise ToolDenied(f"{self.agent}: no model is configured")
+        if not isinstance(prompt, str):
+            raise ToolError("complete: prompt must be a string")
+        model = self._model
+        c = None
+        if self._control is not None:
+            tin, tout, est = model.estimate(prompt, max_tokens)
+            c = self._control.authorize_model(self._job_id, self.agent, model.name, tin + tout, est, run_id=self.run_id)
+            if not c.allowed:
+                self.log.write("control_refused", agent=self.agent, kind="model", name=model.name,
+                               job_id=self._job_id, reason=c.reason)
+                raise JobRefused(f"control gate: {c.reason}")
+        try:
+            out = model.complete(prompt, focus=focus, max_sentences=max_sentences, max_tokens=max_tokens)
+        except Exception as e:
+            if c is not None:
+                self._control.record_error(self._job_id, self.agent, "model", model.name, f"{type(e).__name__}: {e}",
+                                           run_id=self.run_id)
+            raise
+        if c is not None:
+            self._control.record_usage(c, self.agent, tokens_in=out.tokens_in, tokens_out=out.tokens_out,
+                                       cost_usd=out.cost_usd, run_id=self.run_id)
+        self.log.write("model_call", agent=self.agent, model=out.model, tokens_in=out.tokens_in,
+                       tokens_out=out.tokens_out, cost_usd=out.cost_usd,
+                       reason="control gate: allowed" if c is not None else "no control gate configured")
+        return out.text
 
 
 class Orchestrator:
@@ -56,7 +121,7 @@ class Orchestrator:
     def __init__(self, workdir: Path | str, toolbox: ToolBox, gate: Gate, agents: dict | None = None, *,
                  max_retries: int = 3, backoff_base: float = 0.05, sleep: Callable[[float], None] = time.sleep,
                  crash_at: set | None = None, echo: Callable[[dict], None] | None = None, intake_policy=None,
-                 scopes: dict | None = None):
+                 scopes: dict | None = None, control: ControlGate | None = None, model: MockModel | None = None):
         self.workdir = Path(workdir)
         self.toolbox, self.gate = toolbox, gate
         self.agents = agents or {"researcher": MockResearcher(), "writer": MockWriter()}
@@ -65,6 +130,9 @@ class Orchestrator:
         self.echo = echo
         self.intake_policy = intake_policy  # callable(goal) -> (ok, reason); see policy.intake_check
         self.scopes = scopes or {}          # agent name -> AgentScope (folder isolation + forbidden actions)
+        self.control = control              # workload control gate; when set, every call needs an active job
+        self.model = model or MockModel()   # held here, never by agents: they call ctx.complete()
+        self._job_id: str | None = None
 
     # ---------- helpers ----------
     def _crash_point(self, name: str) -> None:
@@ -85,13 +153,14 @@ class Orchestrator:
         return str(p)
 
     # ---------- main entry ----------
-    def run(self, task_in, run_id: str | None = None) -> Result:
+    def run(self, task_in, run_id: str | None = None, job_id: str | None = None) -> Result:
         try:
             task = task_in if isinstance(task_in, TaskRequest) else TaskRequest.from_dict(task_in)
         except ValidationError as e:
             tid = task_in.get("task_id") if isinstance(task_in, dict) and isinstance(task_in.get("task_id"), str) else "?"
             return Result(run_id or "-", tid[:64] or "?", "rejected", "suggestion", "task rejected", reason=f"invalid task: {e}")
         run_id = run_id or task.task_id
+        self._job_id = job_id
         log = RunLog(self.run_dir(run_id) / "events.jsonl", run_id, echo=self.echo)
 
         finished = log.find("run_finished")
@@ -105,6 +174,8 @@ class Orchestrator:
             log.write("run_resumed", completed_steps=[e["step"] for e in log.find("step_completed")])
         else:
             log.write("run_started", task=task.to_dict())
+        if self.control is not None:
+            log.write("job_bound", job_id=job_id)
 
         if self.intake_policy is not None:
             ok, why = self.intake_policy(task.goal)
@@ -129,6 +200,9 @@ class Orchestrator:
                 eff = self._deliver(log, run_id, task.deliver.action, params, task.task_id)
                 if eff is not None:
                     effects.append(eff)
+            except JobRefused as e:
+                return self._finish(log, Result(run_id, task.task_id, "blocked", "draft", f"delivery refused: {e}",
+                                                artifacts=artifacts, reason=str(e), evidence=(f"runlog:{log.path}",)))
             except ToolDenied as e:
                 blocked.append({"action": task.deliver.action,
                                 "request_sha256": request_sha256(task.deliver.action, params, run_id=run_id, task_id=task.task_id),
@@ -163,6 +237,7 @@ class Orchestrator:
             return out, done[-1]["artifact"]
         scope = self.scopes.get(agent_name)
         ctx = ToolContext(agent_name, self.gate, self.toolbox, log, forbidden=scope.forbidden if scope else (),
+                          control=self.control, job_id=self._job_id, model=self.model,
                           run_id=run_id, task_id=task.task_id)
         last = "unknown"
         for attempt in range(1, self.max_retries + 1):
@@ -210,6 +285,13 @@ class Orchestrator:
         if writer_scope is not None and action in writer_scope.forbidden:
             log.write("gate_decision", action=action, allowed=False, reason="forbidden for this agent")
             raise ToolDenied(f"{action} is forbidden for the writer agent")
+        c = None
+        if self.control is not None:  # before the approval gate, so a refused job never consumes an approval
+            c = self.control.authorize_tool(self._job_id, "writer", action, run_id=run_id)
+            if not c.allowed:
+                log.write("control_refused", agent="writer", kind="tool", name=action, job_id=self._job_id,
+                          reason=c.reason)
+                raise JobRefused(f"control gate: {c.reason}")
         d = self.gate.check(action, params, run_id=run_id, task_id=task_id)
         log.write("gate_decision", action=action, allowed=d.allowed, reason=d.reason, request_sha256=sha)
         if not d.allowed:
@@ -222,15 +304,21 @@ class Orchestrator:
                 break
             except TransientToolError as e:
                 last = str(e); log.write("transient_error", step="deliver", attempt=attempt, error=last)
+                if c is not None:
+                    self.control.record_error(self._job_id, "writer", "tool", action, last, run_id=run_id)
                 if attempt < self.max_retries:
                     delay = self.backoff_base * 2 ** (attempt - 1)
                     log.write("retry_scheduled", step="deliver", next_attempt=attempt + 1, delay_s=delay)
                     self.sleep(delay)
             except ToolError as e:
+                if c is not None:
+                    self.control.record_error(self._job_id, "writer", "tool", action, str(e), run_id=run_id)
                 log.write("step_error", step="deliver", error=str(e)); raise StepFailed(f"deliver: {e}")
         else:
             log.write("step_failed", step="deliver", reason=last)
             raise StepFailed(f"deliver: retries exhausted ({last})")
+        if c is not None:
+            self.control.record_usage(c, "writer", run_id=run_id)
         self._crash_point(f"after_effect:{action}")
         eff = {"action": action, "effect_id": res["effect_id"], "idempotency_key": key, "deduped": res["deduped"]}
         log.write("effect_committed", action=action, idempotency_key=key, effect=eff)

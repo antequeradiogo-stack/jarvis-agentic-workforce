@@ -8,7 +8,9 @@ All of this is implemented and covered by tests unless marked **[planned]**.
    that are off the safe allow-list or that contain consequential or injection patterns. A rejected task never
    reaches an agent.
 2. **Steps.** The orchestrator runs `research` (MockResearcher), then `write` (MockWriter). An agent can only act
-   through a `ToolContext`, which applies its scope's forbidden actions, then the gate, then logs the call.
+   through a `ToolContext`, which applies its scope's forbidden actions, then the workload control gate (when one
+   is configured), then the approval gate, then logs the call. Model calls go through `ctx.complete()`, which
+   checks the control gate and then calls the mock model; agents never hold the model.
 3. **Validation.** Raw agent output is untrusted. `AgentOutput.validate` checks exact keys, the expected agent and
    kind, non-empty bounded content and a list of source strings.
 4. **Retries.** Malformed output and `TransientToolError` are retried up to `max_retries` (default 3) with
@@ -27,6 +29,14 @@ Order of checks: approval-like keys anywhere in params → deny (spoofing). Then
 `read_doc`, `summarize`) → allow. Anything else → consume a matching approval or deny. Unknown actions are
 labelled `unregistered:` and denied unless an approval exists for that exact request: the action, its parameters,
 and the run and task it belongs to.
+
+## Workload control
+`ControlGate.authorize_tool` / `authorize_model` check, in order: a `job_id` is present; the registry can be read
+(else refuse, fail closed); the job exists and is `active`; the tool or model is on its allow-list; the budget is
+not exceeded (model calls reserve worst-case tokens and cost with a conditional write, then settle to actual).
+Every allow and refuse is appended to `control/audit.jsonl`; usage lines carry tokens and cost. Registry reads are
+cached for `ttl_s` (default 30 s), which bounds the stop delay. A control refusal ends the run as **blocked**;
+after `jobs resume` the run continues from its checkpoint. AWS design: `docs/aws-control-plane.md`.
 
 ## Run log = audit trail + checkpoint
 `runs/<run_id>/events.jsonl`, one fsync'd JSON object per line (`seq`, `ts`, `run_id`, `event`, fields). A torn last
@@ -55,7 +65,10 @@ external API that supports idempotency keys.
 | `agents.py` | MockResearcher, MockWriter, ScriptedAgent (scripted faults for tests/demo) |
 | `tools.py` | mock tools, extractive `summarize`, mock outbox with idempotency |
 | `runlog.py` | append-only JSONL log |
+| `control.py` | job registry (JSON file, lock, conditional charge), `ControlGate` (fail closed, TTL cache, allow-lists, budget, auto-stop rules), audit log, `cost_summary` |
+| `llm.py` | offline `MockModel` with token counting and illustrative pricing |
+| `jobs.py` | job registry CLI: init, register, stop (kill switch), resume, list, show, costs |
 | `policy.py`, `scope.py` | ported intake classifier, per-agent isolation |
-| `demo.py`, `run.py`, `approve.py` | CLIs |
+| `demo.py`, `run.py`, `approve.py` | CLIs (`run --job` turns on the control gate) |
 
 **[planned]** Pluggable LLM agents (the mock stays the default), a task queue/API, and an AWS deployment (see roadmap).

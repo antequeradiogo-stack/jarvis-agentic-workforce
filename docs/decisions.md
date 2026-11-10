@@ -28,3 +28,14 @@
     layers are active.
 14. **An approval is bound to the run and the task as well as the action and params.** The same task started under
     two run ids is two requests. An approval for one is not consumed by the other, and it stays single-use.
+15. **Workload control sits in the call path, not in agent code.** Agents never hold the model client or the tool
+    box; `ToolContext` owns both and asks `ControlGate` first. This follows OpenAI's Control Room write-up: put the
+    check where every call must pass, because agent code changes often. Without a configured gate the orchestrator
+    behaves as before (back-compatible library mode); `run --job` and the AWS design always use it.
+16. **Fail closed, with a bounded cache.** A missing or corrupt registry refuses every call; an expired cache entry
+    is never served while the registry is down. The 30 s TTL trades registry load for stop delay, and the TTL is
+    capped at 300 s so a config mistake cannot make the kill switch slow. Budget reservations are fresh conditional
+    writes, so money is never spent on a cached "active".
+17. **Reserve worst case, then settle.** A model call reserves prompt tokens plus `max_tokens` before it runs and
+    settles to actual usage after. A failed settle leaves the reservation charged: counting too much is the safe
+    direction. Spend is stored in integer micro-USD.
