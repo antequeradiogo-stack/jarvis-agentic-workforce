@@ -1,5 +1,6 @@
-"""Deterministic mock agents (no LLM). Each agent only acts through ``ctx.call`` (gate-checked) and returns a
-plain dict, which the orchestrator validates as untrusted output."""
+"""Deterministic mock agents (no LLM). Each agent only acts through ``ctx.call`` (tools) and ``ctx.complete``
+(model), both gate-checked, and returns a plain dict, which the orchestrator validates as untrusted output.
+Agents never import or hold a model client."""
 from __future__ import annotations
 import re
 
@@ -21,7 +22,7 @@ class MockResearcher:
             text = ctx.call("read_doc", {"name": name})
             if not goal & _words(text):
                 continue
-            findings.append((name, ctx.call("summarize", {"text": text, "max_sentences": 2, "focus": task.goal})))
+            findings.append((name, ctx.complete(text, focus=task.goal, max_sentences=2)))
             picked.append(name)
             if len(picked) == 3:
                 break

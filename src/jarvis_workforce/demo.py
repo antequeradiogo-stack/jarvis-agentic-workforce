@@ -2,7 +2,7 @@
 
   PYTHONPATH=src python -m jarvis_workforce.demo                # all scenarios
   PYTHONPATH=src python -m jarvis_workforce.demo --scenario approve
-Scenarios: research, blocked, approve, forged, faults, crash, injection. Everything runs in a temp dir with mock tools and a
+Scenarios: research, blocked, approve, forged, faults, crash, injection, control. Everything runs in a temp dir with mock tools and a
 synthetic corpus. The approval key comes from JARVIS_APPROVAL_KEY / .env if set, else an ephemeral random key that
 is never written to disk."""
 from __future__ import annotations
@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .agents import MockWriter, ScriptedAgent, MockResearcher
 from .approval_store import ApprovalError, ApprovalStore, load_key
+from .control import AuditLog, ControlGate, JobRegistry, cost_summary
 from .gate import Gate
 from .orchestrator import Orchestrator, SimulatedCrash
 from .policy import intake_check
@@ -32,6 +33,10 @@ def fmt(e: dict) -> str | None:
         "step_started": lambda: f" - step '{g('step')}' -> agent {g('agent')} (attempt {g('attempt')})",
         "tool_call": lambda: f"     [{g('agent')}] {g('action'):<10} ALLOW  {g('reason')}",
         "tool_denied": lambda: f"     [{g('agent')}] {g('action'):<10} DENY   {g('reason')}",
+        "model_call": lambda: f"     [{g('agent')}] model {g('model')} ALLOW  {g('tokens_in')}+{g('tokens_out')} tokens, "
+                              f"${g('cost_usd'):.6f} ({g('reason')})",
+        "control_refused": lambda: f"     [{g('agent')}] {g('kind')} {g('name')} REFUSED by control gate: {g('reason')}",
+        "job_bound": lambda: f"   control gate on: job_id={g('job_id')}",
         "malformed_output": lambda: f"     x malformed output rejected: {g('error')}",
         "transient_error": lambda: f"     x transient error: {g('error')}",
         "retry_scheduled": lambda: f"     ~ retry #{g('next_attempt')} after {g('delay_s')}s backoff",
@@ -57,14 +62,14 @@ def echo(e: dict) -> None:
 
 
 class Env:
-    def __init__(self, work: Path, key: bytes, faults=None, agents=None, crash_at=None):
+    def __init__(self, work: Path, key: bytes, faults=None, agents=None, crash_at=None, control=None):
         self.work = work
         self.store = ApprovalStore(work / "approvals", key)
         self.toolbox = ToolBox(CORPUS, work / "mock_outbox", faults=faults)
         scopes = {n: AgentScope(work / "agents", n, forbidden=f) for n, f in
                   (("researcher", ("send_email", "publish", "purchase")), ("writer", ("purchase",)))}
         self.orch = Orchestrator(work, self.toolbox, Gate(self.store), agents, backoff_base=0.05, echo=echo,
-                                 crash_at=crash_at, intake_policy=intake_check, scopes=scopes)
+                                 crash_at=crash_at, intake_policy=intake_check, scopes=scopes, control=control)
 
 
 def task(name: str) -> dict:
@@ -155,9 +160,36 @@ def s_injection(work, key):
     Env(work / "s7", key).orch.run(t)
 
 
+def s_control(work, key):
+    header("8. workload control: registered job runs; kill switch stops it; registry down -> refuse everything")
+    reg = JobRegistry(work / "s8" / "control" / "jobs.json"); reg.init()
+    audit = AuditLog(reg.path.with_name("audit.jsonl"))
+    clock = [0.0]  # simulated monotonic clock for the 30 s cache window, so the demo needs no sleeps
+    gate = ControlGate(reg, audit, ttl_s=30, clock=lambda: clock[0])
+    reg.register("demo-job-001", "operator", ["list_docs", "read_doc"], ["mock-small"], budget_usd=0.01)
+    env = Env(work / "s8", key, control=gate)
+    t = task("research_only.json"); t["task_id"] = "demo-control-001"
+    env.orch.run(t, job_id="demo-job-001")
+    print("   kill switch: python -m jarvis_workforce.jobs stop demo-job-001 (another process, so this gate's cache"
+          " still holds 'active')")
+    reg.set_status("demo-job-001", "stopped", "manual stop from the demo")
+    d = gate.authorize_tool("demo-job-001", "researcher", "list_docs")
+    print(f"   same second, cached: list_docs {'ALLOW' if d.allowed else 'REFUSE'} (stop delay <= TTL 30 s)")
+    clock[0] += 30
+    t2 = task("research_only.json"); t2["task_id"] = "demo-control-002"
+    print("   30 s later (simulated), a new run of the stopped job:")
+    env.orch.run(t2, job_id="demo-job-001")
+    t3 = task("research_only.json"); t3["task_id"] = "demo-control-003"
+    reg.path.write_text("{ not json")
+    print("   registry corrupted (simulates the registry being down):")
+    clock[0] += 30
+    env.orch.run(t3, job_id="demo-job-001")
+    print("   cost per job from the audit log:", json.dumps(cost_summary(audit.entries())["demo-job-001"]))
+
+
 SCENARIOS = {"research": s_research, "blocked": lambda w, k: s_blocked_and_approve(w, k, False),
              "approve": lambda w, k: s_blocked_and_approve(w, k, True), "forged": s_forged, "faults": s_faults,
-             "crash": s_crash, "injection": s_injection}
+             "crash": s_crash, "injection": s_injection, "control": s_control}
 
 
 def main(argv=None) -> int:

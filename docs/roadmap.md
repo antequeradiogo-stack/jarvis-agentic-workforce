@@ -9,6 +9,9 @@ Rule: one complete, tested workflow before breadth. Phases 0-3 are done; everyth
 - **Phase 2 (M2):** HMAC single-use expiring approvals with the key from env/.env; `approve` and `run` CLIs;
   checkpoint resume with idempotency keys; tests for replay, expiry, tamper, concurrency, resume.
 - **Phase 3 (M3):** ported intake policy and agent scope; offline runner; scripts and Makefile; CI workflow file.
+- **Workload control (2026-11-10):** job registry, one control gate for every model and tool call, fail closed,
+  30 s cache, kill switch CLI, auto-stop rules, audit log with cost per job (`control.py`, `jobs.py`); AWS
+  DynamoDB design in `aws-control-plane.md`.
 - **Demo recording:** `docs/media/demo.gif` (+ asciicast) rendered from real CLI runs by `scripts/record_demo.py`.
 
 ## Next (planned)
@@ -21,6 +24,8 @@ Rule: one complete, tested workflow before breadth. Phases 0-3 are done; everyth
 ## AWS deployment (design first; deploy only with explicit approval and a budget alarm)
 - **Shape:** API Gateway (HTTP API, IAM/JWT auth) → Lambda `submit` → Step Functions Standard workflow
   (research → write → `WaitForTaskToken` for human approval → deliver). Each agent is a Lambda.
+- **Workload control:** DynamoDB `jarvis-jobs` registry + a gate Lambda that is the only role allowed to invoke
+  models (see `aws-control-plane.md`).
 - **State:** DynamoDB for tasks, run events (or S3 JSONL) and approvals. Single-use approval is a conditional
   write (`attribute_not_exists(nonce)`). Idempotency keys use a conditional put.
 - **Approval signer:** a KMS asymmetric key (ECC_NIST_P256). Only the approver's role has `kms:Sign`; agent roles get
